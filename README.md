@@ -1,14 +1,11 @@
-# March PPG → SBP (Deep Learning, Minimal)
+#  PPG → SBP 
 
-This repository is a **minimal, reproducible** project for:
+This repository is a reproducible project for APSC 598P:
 
 - Preprocessing: `PPG(finger+wrist) + HR → SBP`
 - Nature-style preprocessing visualizations (PNG)
 - A PyTorch deep learning baseline (GPU / Colab)
 
-Note: by default, raw data is not meant to be committed to GitHub. You can either:
-- **Recommended (traceable)**: start from raw `.bin/.b` and generate `derived/` tables via scripts
-- **Quick**: directly provide `derived/finger.csv`, `derived/wrist.csv`, `derived/labels.csv`
 
 ---
 
