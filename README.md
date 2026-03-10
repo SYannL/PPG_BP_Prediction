@@ -35,7 +35,7 @@ PPG_BP_Prediction/
 │   └── train_march_sbp_torch.py
 ├── requirements.txt
 ├── .gitignore
-└── README_COLAB.md
+└── (no Colab-specific README)
 ```
 
 ---

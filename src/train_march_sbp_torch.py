@@ -1,5 +1,9 @@
 """
-PPG + HR -> SBP（PyTorch, 可复现, 支持 GPU）。
+PPG + HR -> SBP (PyTorch, GPU-ready).
+
+User-requested simplified training:
+- Do NOT split by subject.
+- Train on the whole dataset, with an optional random validation split for monitoring.
 """
 
 from __future__ import annotations
@@ -12,8 +16,13 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
 def set_seed(seed: int) -> None:
@@ -34,6 +43,13 @@ def get_device(force_cpu: bool = False) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def shuffle_labels(y: np.ndarray, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    y2 = y.copy()
+    rng.shuffle(y2)
+    return y2
+
+
 class AttentionPool1d(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -45,7 +61,7 @@ class AttentionPool1d(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, ff_mult: int = 4):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.15, ff_mult: int = 4):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
@@ -68,10 +84,18 @@ class TransformerBlock(nn.Module):
 
 
 class PpgBranch(nn.Module):
-    def __init__(self, in_ch: int, d_model: int, n_layers: int, n_heads: int, dropout: float, t_max: int = 600):
+    def __init__(
+        self,
+        in_ch: int,
+        d_model: int = 96,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        dropout: float = 0.20,
+        t_max: int = 600,
+    ):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv1d(in_ch, d_model, kernel_size=7, padding=3),
+            nn.Conv1d(in_ch, d_model, kernel_size=9, padding=4),
             nn.GELU(),
             nn.BatchNorm1d(d_model),
             nn.Conv1d(d_model, d_model, kernel_size=5, padding=2),
@@ -92,8 +116,8 @@ class PpgBranch(nn.Module):
         return self.pool(x)
 
 
-class PpgSbpModel(nn.Module):
-    def __init__(self, d_model: int = 128, n_layers: int = 3, n_heads: int = 4, dropout: float = 0.15):
+class Model(nn.Module):
+    def __init__(self, d_model: int = 96, n_layers: int = 3, n_heads: int = 4, dropout: float = 0.20):
         super().__init__()
         self.finger = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
         self.wrist = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
@@ -110,8 +134,7 @@ class PpgSbpModel(nn.Module):
         f = self.finger(x[:, :, 0:2])
         w = self.wrist(x[:, :, 2:4])
         h = self.hr_mlp(hr)
-        z = torch.cat([f, w, h], dim=-1)
-        return self.head(z).squeeze(-1)
+        return self.head(torch.cat([f, w, h], dim=-1)).squeeze(-1)
 
 
 @dataclass(frozen=True)
@@ -121,33 +144,79 @@ class TrainConfig:
     lr: float = 2e-4
     weight_decay: float = 1e-3
     patience: int = 35
-    folds: int = 4
     seed: int = 42
+    huber_delta: float = 1.0
+
+
+def _standardize_y(y: np.ndarray, mean: float, std: float) -> np.ndarray:
+    return (y - mean) / std
+
+
+def _destandardize_y(yz: np.ndarray, mean: float, std: float) -> np.ndarray:
+    return yz * std + mean
+
+
+def _apply_augmentation(
+    xb: torch.Tensor,
+    noise_std: float,
+    max_shift: int,
+    channel_drop_p: float,
+) -> torch.Tensor:
+    """
+    xb: (B,T,C) z-scored input
+    """
+    if noise_std > 0:
+        xb = xb + torch.randn_like(xb) * noise_std
+    if max_shift > 0:
+        # random circular-ish shift with edge padding (no wrap)
+        B, T, C = xb.shape
+        shifts = torch.randint(low=-max_shift, high=max_shift + 1, size=(B,), device=xb.device)
+        x2 = xb.clone()
+        for i in range(B):
+            s = int(shifts[i].item())
+            if s == 0:
+                continue
+            if s > 0:
+                x2[i, s:, :] = xb[i, : T - s, :]
+                x2[i, :s, :] = xb[i, 0:1, :].expand(s, C)
+            else:
+                s = -s
+                x2[i, : T - s, :] = xb[i, s:, :]
+                x2[i, T - s :, :] = xb[i, -1:, :].expand(s, C)
+        xb = x2
+    if channel_drop_p > 0:
+        # drop entire channel with small probability
+        drop = torch.rand((xb.shape[0], 1, xb.shape[2]), device=xb.device) < channel_drop_p
+        xb = xb.masked_fill(drop, 0.0)
+    return xb
 
 
 def _to_tensor(x: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32, device=device)
 
 
-def train_one_fold(
+def train_all(
     X: np.ndarray,
     hr: np.ndarray,
     y: np.ndarray,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
     cfg: TrainConfig,
     device: torch.device,
-) -> Dict[str, float]:
-    model = PpgSbpModel().to(device)
+    val_ratio: float,
+) -> Dict[str, object]:
+    model = Model().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    loss_fn = nn.HuberLoss(delta=10.0)
+    loss_fn = nn.HuberLoss(delta=cfg.huber_delta)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(cfg.epochs, 1))
 
-    Xtr, Htr, Ytr = X[train_idx], hr[train_idx], y[train_idx]
-    Xva, Hva, Yva = X[val_idx], hr[val_idx], y[val_idx]
+    idx = np.arange(len(y))
+    tr_idx, va_idx = train_test_split(idx, test_size=val_ratio, random_state=cfg.seed, shuffle=True)
+    Xtr, Htr, Ytr = X[tr_idx], hr[tr_idx], y[tr_idx]
+    Xva, Hva, Yva = X[va_idx], hr[va_idx], y[va_idx]
 
-    best_mae = float("inf")
-    best_state = None
+    best = {"mae": float("inf"), "state": None}
     patience_left = cfg.patience
+    tr_curve = []
+    va_curve = []
 
     def batches(n: int):
         order = np.random.permutation(n)
@@ -156,39 +225,53 @@ def train_one_fold(
 
     for epoch in range(cfg.epochs):
         model.train()
-        for b in batches(len(train_idx)):
+        losses = []
+        for b in batches(len(tr_idx)):
             pred = model(_to_tensor(Xtr[b], device), _to_tensor(Htr[b], device))
             loss = loss_fn(pred, _to_tensor(Ytr[b], device))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            losses.append(float(loss.detach().cpu().item()))
 
         model.eval()
         with torch.no_grad():
-            pv = model(_to_tensor(Xva, device), _to_tensor(Hva, device)).cpu().numpy()
+            pv_t = model(_to_tensor(Xva, device), _to_tensor(Hva, device))
+            va_loss = float(loss_fn(pv_t, _to_tensor(Yva, device)).detach().cpu().item())
+            pv = pv_t.cpu().numpy()
+        tr_loss = float(np.mean(losses)) if losses else float("nan")
+        tr_curve.append(tr_loss)
+        va_curve.append(va_loss)
         mae = float(mean_absolute_error(Yva, pv))
         if epoch % 20 == 0 or epoch == cfg.epochs - 1:
-            print(f"  epoch {epoch:3d} val_mae={mae:.3f}")
+            print(f"  epoch {epoch:3d} train_loss={tr_loss:.4f} val_loss={va_loss:.4f} val_mae={mae:.3f}")
 
-        if mae < best_mae:
-            best_mae = mae
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if mae < best["mae"]:
+            best = {"mae": mae, "state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}}
             patience_left = cfg.patience
         else:
             patience_left -= 1
             if patience_left <= 0:
                 break
+        sched.step()
 
-    if best_state is not None:
-        model.load_state_dict(best_state, strict=True)
+    if best["state"] is not None:
+        model.load_state_dict(best["state"], strict=True)
     model.eval()
     with torch.no_grad():
         pv = model(_to_tensor(Xva, device), _to_tensor(Hva, device)).cpu().numpy()
     mae = float(mean_absolute_error(Yva, pv))
-    rmse = float(mean_squared_error(Yva, pv, squared=False))
+    rmse = float(np.sqrt(float(mean_squared_error(Yva, pv))))
     r2 = float(r2_score(Yva, pv))
-    return {"mae": mae, "rmse": rmse, "r2": r2}
+    return {
+        "val_mae": mae,
+        "val_rmse": rmse,
+        "val_r2": r2,
+        "train_curve": tr_curve,
+        "val_curve": va_curve,
+        "best_state_dict": best["state"],
+    }
 
 
 def main() -> None:
@@ -196,6 +279,10 @@ def main() -> None:
     p.add_argument("--data", type=str, default="march_sbp_dataset.npz")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
+    p.add_argument("--val-ratio", type=float, default=0.2, help="Random validation split ratio")
+    p.add_argument("--shuffle-labels", action="store_true", help="Shuffle labels (sanity check)")
+    p.add_argument("--save-dir", type=str, default=None, help="If set, save best model (.pt) and metrics (.npz)")
+    p.add_argument("--plot", action="store_true", help="Save train/val loss curves into save-dir (PNG)")
     args = p.parse_args()
 
     cfg = TrainConfig(seed=args.seed)
@@ -207,21 +294,40 @@ def main() -> None:
     X = z["X"]
     hr = z["hr"]
     y = z["y"]
-    groups = z["group"]
+    if args.shuffle_labels:
+        y = shuffle_labels(y, seed=args.seed)
 
-    gkf = GroupKFold(n_splits=min(cfg.folds, len(np.unique(groups))))
-    ms = []
-    for fold, (tr, va) in enumerate(gkf.split(X, y, groups=groups), 1):
-        print(f"\nFold {fold}")
-        m = train_one_fold(X, hr, y, tr, va, cfg, device)
-        ms.append(m)
-        print(f"Fold {fold}: MAE={m['mae']:.3f}, RMSE={m['rmse']:.3f}, R2={m['r2']:.3f}")
-
-    mae = float(np.mean([m["mae"] for m in ms]))
-    rmse = float(np.mean([m["rmse"] for m in ms]))
-    r2 = float(np.mean([m["r2"] for m in ms]))
+    out = train_all(X, hr, y, cfg, device, val_ratio=float(args.val_ratio))
     print("-" * 60)
-    print(f"Avg: MAE={mae:.3f}, RMSE={rmse:.3f}, R2={r2:.3f}")
+    print(f"VAL: MAE={out['val_mae']:.3f}, RMSE={out['val_rmse']:.3f}, R2={out['val_r2']:.3f}")
+
+    if args.save_dir:
+        sd = Path(args.save_dir)
+        sd.mkdir(parents=True, exist_ok=True)
+        torch.save(out["best_state_dict"], sd / "best_state_dict.pt")
+        np.savez_compressed(
+            sd / "metrics.npz",
+            val_mae=np.array([out["val_mae"]], float),
+            val_rmse=np.array([out["val_rmse"]], float),
+            val_r2=np.array([out["val_r2"]], float),
+            seed=np.array([args.seed], int),
+            shuffle_labels=np.array([args.shuffle_labels], bool),
+            val_ratio=np.array([args.val_ratio], float),
+        )
+        print(f"Wrote {sd/'best_state_dict.pt'} and {sd/'metrics.npz'}")
+        if args.plot and plt is not None:
+            fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.2))
+            ax.plot(out["train_curve"], label="train loss")
+            ax.plot(out["val_curve"], label="val loss")
+            ax.set_xlabel("epoch")
+            ax.set_ylabel("Huber loss")
+            ax.set_title("Train/Val loss curves")
+            ax.grid(True, alpha=0.25)
+            ax.legend(frameon=True)
+            fig.tight_layout()
+            fig.savefig(sd / "loss_curves.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Wrote {sd/'loss_curves.png'}")
 
 
 if __name__ == "__main__":
