@@ -5,6 +5,7 @@ This repository is the DL part of UnderPressure for APSC 598P:
 - Preprocessing: `PPG(finger+wrist) + HR → SBP`
 - Nature-style preprocessing visualizations (PNG)
 - A PyTorch deep learning baseline (GPU / Colab)
+- **Two input modes** for both tasks: (1) **PPG + HR** and (2) **PPG only** (no heart rate). Same backbone architecture; PPG-only variants are useful for ablation or when HR is unavailable.
 
 
 ---
@@ -34,7 +35,9 @@ PPG_BP_Prediction/
 │   ├── convert_march_raw_to_ppg_csv.py    # batch raw/ → ppg_csv/ converter
 │   ├── build_march_tables_from_xlsx.py    # Excel + CSV → derived/ tables
 │   ├── train_march_sbp_torch.py           # SBP regression (PPG + HR)
-│   └── train_march_state_torch.py         # posture / planking classifier
+│   ├── train_march_sbp_ppg_only_torch.py  # SBP regression (PPG only, no HR)
+│   ├── train_march_state_torch.py         # posture / planking classifier
+│   └── train_march_state_ppg_only_torch.py# posture classifier (PPG only, no HR)
 ├── requirements.txt
 └── .gitignore
 ```
@@ -100,6 +103,26 @@ python src/train_march_state_torch.py \
   --seed 42 \
   --save-dir results/state_binary \
   --plot
+```
+
+### PPG-only variants (same model, no HR input)
+
+Same architecture as above, but **without heart rate** as input. Useful for ablation or when HR is unavailable.
+
+**SBP regression (PPG only):**
+
+```bash
+python src/train_march_sbp_ppg_only_torch.py --data march_sbp_dataset.npz --seed 42 --save-dir results/sbp_ppg_only --plot
+```
+
+**State classification (PPG only):**
+
+```bash
+# three_class
+python src/train_march_state_ppg_only_torch.py --data march_sbp_dataset.npz --mode three_class --seed 42 --save-dir results/state_3class_ppg_only --plot
+
+# binary
+python src/train_march_state_ppg_only_torch.py --data march_sbp_dataset.npz --mode binary --seed 42 --save-dir results/state_binary_ppg_only --plot
 ```
 
 ---
@@ -315,6 +338,11 @@ This subsection gives a more formal, implementation‑level description of the c
   - Batch size: 8, with gradient clipping at `max_norm = 1.0`.
   - Early stopping: patience ≈ 35 epochs based on validation error.
   - Metrics: MAE, RMSE, and R² computed after de‑standardizing SBP.
+
+- **PPG-only variants (`train_march_sbp_ppg_only_torch.py`, `train_march_state_ppg_only_torch.py`)**
+  - Same dual PPG branch backbone and head structure as the PPG+HR versions.
+  - **No HR sub-network**; head input is `concat(z_finger, z_wrist) ∈ ℝ^{N×(2*d_model)}`.
+  - Same hyper‑parameters and training strategy; useful for ablation or when HR is unavailable.
 
 - **State / planking classifier (`train_march_state_torch.py`)**
   - Backbone:

@@ -136,6 +136,16 @@ def _ppg_pipeline(f_ir, f_red, w_ir, w_red, fs_in=50.0, factor=5):
         return out
 
     f_ir, f_red, w_ir, w_red = map(fill, (f_ir, f_red, w_ir, w_red))
+
+    # invert PPG orientation for visualization only: new = max - current (per sample)
+    def invert(mat):
+        inv = np.zeros_like(mat, float)
+        for i in range(mat.shape[0]):
+            m = np.max(mat[i])
+            inv[i] = m - mat[i]
+        return inv
+
+    f_ir, f_red, w_ir, w_red = map(invert, (f_ir, f_red, w_ir, w_red))
     X_raw = np.stack([f_ir, f_red, w_ir, w_red], axis=-1)  # (N,3000,4)
     N, T, C = X_raw.shape
     X2 = X_raw.transpose(0, 2, 1).reshape(N * C, T)
@@ -223,6 +233,74 @@ def plot_psd(X_raw: np.ndarray, X_filt: np.ndarray, fs_in: float, out_dir: Path)
     _save(fig, out_dir / "04_psd_raw_vs_filtered")
 
 
+def plot_example_ppg_traces(
+    X_raw: np.ndarray,
+    X_filt: np.ndarray,
+    X_ds: np.ndarray,
+    X_norm: np.ndarray,
+    labels: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """
+    Plot PPG time series at each preprocessing step for one subject.
+    Four rows: (1) max−current inverted, (2) + bandpass, (3) + downsample, (4) + z-score.
+    Two cols: sit | plank. Each subplot overlays the four channels.
+    """
+    if X_raw.shape[0] == 0:
+        return
+
+    names = labels["name"].astype(str).to_numpy()
+    states = labels["state"].astype(str).to_numpy()
+    chosen = None
+    for nm in np.unique(names):
+        mask_nm = names == nm
+        if np.any(mask_nm & (states == "sit")) and np.any(mask_nm & (states == "plank")):
+            chosen = nm
+            break
+    if chosen is None:
+        idx_sit, idx_plank = 0, min(1, X_raw.shape[0] - 1)
+        title_suffix = ""
+    else:
+        idx_sit = np.where((names == chosen) & (states == "sit"))[0][0]
+        idx_plank = np.where((names == chosen) & (states == "plank"))[0][0]
+        title_suffix = f" (subject={chosen})"
+
+    steps = [
+        (X_raw, 50.0, "Polarity inversion (max − x)", "a.u."),
+        (X_filt, 50.0, "Bandpass filter (0.5–8 Hz)", "a.u."),
+        (X_ds, 10.0, "Downsampling (10 Hz)", "a.u."),
+        (X_norm, 10.0, "Z-score normalization", "z-score"),
+    ]
+    ch_names = ["finger_ir", "finger_red", "wrist_ir", "wrist_red"]
+
+    fig, axes = plt.subplots(4, 2, figsize=(11.0, 10.0), sharex="col")
+    xticks = [0, 2, 4, 6, 8, 10]
+    for row, (X, fs, step_label, ylabel) in enumerate(steps):
+        x_sit = X[idx_sit]
+        x_plank = X[idx_plank]
+        t_sit = np.arange(x_sit.shape[0]) / fs
+        t_plank = np.arange(x_plank.shape[0]) / fs
+        for ax, x, t, st in zip(axes[row], (x_sit, x_plank), (t_sit, t_plank), ("sit", "plank")):
+            for ci, ch in enumerate(ch_names):
+                ax.plot(t, x[:, ci], label=ch.replace("_", " "), color=COL.get(ch, "#666666"), alpha=0.85)
+            ax.set_title((("Seated" if st == "sit" else "Plank") + title_suffix) if row == 0 else "")
+            ax.set_xlim(0, 10)
+            ax.set_xticks(xticks)
+            ax.tick_params(axis="x", labelbottom=True)
+            ax.grid(True, alpha=0.2)
+        axes[row, 0].set_ylabel(f"{step_label}\n({ylabel})")
+        if row == 0:
+            leg = axes[row, 0].legend(frameon=True, ncol=1, loc="upper right", fontsize=8)
+            leg.get_frame().set_edgecolor("#000000")
+            leg.get_frame().set_linewidth(0.8)
+            leg.get_frame().set_facecolor("white")
+            leg.get_frame().set_alpha(1.0)
+    for ax in axes[-1]:
+        ax.set_xlabel("Time (s)")
+    fig.suptitle("PPG preprocessing pipeline: Seated vs Plank posture", y=0.995)
+    _save(fig, out_dir / "02_example_ppg_traces")
+
+
 def plot_ppg_distribution_by_state(X_norm: np.ndarray, labels: pd.DataFrame, out_dir: Path) -> None:
     states = ["lay", "sit", "plank"]
     ch_names = ["finger_ir", "finger_red", "wrist_ir", "wrist_red"]
@@ -297,6 +375,7 @@ def main() -> None:
     X_raw, X_filt, X_ds, X_norm = _ppg_pipeline(f_ir, f_red, w_ir, w_red)
     plot_overview(labels_a, out_dir)
     plot_psd(X_raw, X_filt, 50.0, out_dir)
+    plot_example_ppg_traces(X_raw, X_filt, X_ds, X_norm, labels_a, out_dir)
     plot_correlation_post(X_norm, labels_a, out_dir)
     plot_ppg_distribution_by_state(X_norm, labels_a, out_dir)
 
