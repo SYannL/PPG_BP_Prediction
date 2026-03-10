@@ -27,9 +27,15 @@ PPG_BP_Prediction/
 │       └── labels.csv
 ├── figures/                  # generated figures (PNG)
 ├── src/
-│   ├── preprocess_march_sbp.py
-│   ├── visualize_march_preprocess.py
-│   └── train_march_sbp_torch.py
+│   ├── run.ipynb                          # end-to-end Jupyter pipeline
+│   ├── preprocess_march_sbp.py            # build march_sbp_dataset.npz
+│   ├── visualize_march_preprocess.py      # Nature-style preprocessing figures
+│   ├── convert_imuppg_bin_to_csv.py       # single-file bin → CSV converter
+│   ├── convert_march_raw_to_ppg_csv.py    # batch raw/ → ppg_csv/ converter
+│   ├── build_march_tables_from_xlsx.py    # Excel + CSV → derived/ tables
+│   ├── train_march_sbp_torch.py           # SBP regression (PPG + HR)
+│   ├── train_march_state_torch.py         # posture / planking classifier
+│   └── train_march_state_torch2.py        # (experimental / alternate classifier)
 ├── requirements.txt
 ├── .gitignore
 └── (no Colab-specific README)
