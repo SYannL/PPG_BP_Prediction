@@ -1,111 +1,3 @@
-
----
-
-## 4) Reference results and reproducibility
-
-The following numbers are from one representative training run on the March dataset
-using the default seeds and hyper‑parameters in this repository.
-Because the dataset is small, re‑training may give slightly different values but should be in a similar range.
-
-All results are **fully reproducible** in a Jupyter notebook by:
-- Preparing `march_sbp_dataset.npz` as described above.
-- Running the corresponding training scripts cell‑by‑cell with the same CLI arguments.
-
-### 4.1 SBP regression (all samples, random train/val split)
-
-Command:
-
-```bash
-python src/train_march_sbp_torch.py \
-  --data march_sbp_dataset.npz \
-  --seed 42 \
-  --save-dir results/all_train \
-  --plot
-```
-
-Summary of one run:
-
-- Device: `cuda` (GPU available).
-- Final validation performance:
-  - **MAE** ≈ **8.0 mmHg**
-  - **RMSE** ≈ **12.6 mmHg**
-  - **R²** ≈ **0.54**
-- Artifacts:
-  - `results/all_train/best_state_dict.pt`
-  - `results/all_train/metrics.npz`
-  - `results/all_train/loss_curves.png`
-
-### 4.2 Three‑class posture classification (sit / lay / plank)
-
-Command:
-
-```bash
-python src/train_march_state_torch.py \
-  --data march_sbp_dataset.npz \
-  --mode three_class \
-  --seed 42 \
-  --save-dir results/state_3class \
-  --plot
-```
-
-Summary of one run:
-
-- Validation:
-  - **ACC** ≈ **0.71**
-  - **Macro‑F1** ≈ **0.55**
-- Test:
-  - **ACC** ≈ **0.71**
-  - **Macro‑F1** ≈ **0.70**
-  - Confusion matrix (rows = true, cols = predicted):
-
-    \[
-    \begin{bmatrix}
-    1 & 1 & 1 \\
-    0 & 2 & 0 \\
-    0 & 0 & 2
-    \end{bmatrix}
-    \]
-
-- Artifacts:
-  - `results/state_3class/best_state_dict.pt`
-  - `results/state_3class/metrics.npz`
-  - `results/state_3class/confusion_matrix.png`
-
-### 4.3 Binary planking detection (rest vs plank)
-
-Command:
-
-```bash
-python src/train_march_state_torch.py \
-  --data march_sbp_dataset.npz \
-  --mode binary \
-  --seed 42 \
-  --save-dir results/state_binary \
-  --plot
-```
-
-Summary of one run (with class weighting and balanced sampling):
-
-- Validation:
-  - **ACC** = **1.00**
-  - **Macro‑F1** = **1.00**
-- Test:
-  - **ACC** = **1.00**
-  - **Macro‑F1** = **1.00**
-  - Confusion matrix (rows = true, cols = predicted):
-
-    \[
-    \begin{bmatrix}
-    5 & 0 \\
-    0 & 2
-    \end{bmatrix}
-    \]
-
-- Artifacts:
-  - `results/state_binary/best_state_dict.pt`
-  - `results/state_binary/metrics.npz`
-  - `results/state_binary/confusion_matrix.png`
-
 # March PPG → SBP (Deep Learning, Minimal)
 
 This repository is a **minimal, reproducible** project for:
@@ -422,4 +314,112 @@ This subsection gives a more formal, implementation‑level description of the c
     - Metrics:
       - Validation: accuracy and macro‑F1.
       - Test: accuracy, macro‑F1, and confusion matrices for both validation and test sets.
+
+
+---
+
+## 4) Reference results and reproducibility
+
+The following numbers are from one representative training run on the March dataset
+using the default seeds and hyper‑parameters in this repository.
+Because the dataset is small, re‑training may give slightly different values but should be in a similar range.
+
+All results are **fully reproducible** in a Jupyter notebook by:
+- Preparing `march_sbp_dataset.npz` as described above.
+- Running the corresponding training scripts cell‑by‑cell with the same CLI arguments.
+
+### 4.1 SBP regression (all samples, random train/val split)
+
+Command:
+
+```bash
+python src/train_march_sbp_torch.py \
+  --data march_sbp_dataset.npz \
+  --seed 42 \
+  --save-dir results/all_train \
+  --plot
+```
+
+Summary of one run:
+
+- Device: `cuda` (GPU available).
+- Final validation performance:
+  - **MAE** ≈ **8.0 mmHg**
+  - **RMSE** ≈ **12.6 mmHg**
+  - **R²** ≈ **0.54**
+- Artifacts:
+  - `results/all_train/best_state_dict.pt`
+  - `results/all_train/metrics.npz`
+  - `results/all_train/loss_curves.png`
+
+### 4.2 Three‑class posture classification (sit / lay / plank)
+
+Command:
+
+```bash
+python src/train_march_state_torch.py \
+  --data march_sbp_dataset.npz \
+  --mode three_class \
+  --seed 42 \
+  --save-dir results/state_3class \
+  --plot
+```
+
+Summary of one run:
+
+- Validation:
+  - **ACC** ≈ **0.71**
+  - **Macro‑F1** ≈ **0.55**
+- Test:
+  - **ACC** ≈ **0.71**
+  - **Macro‑F1** ≈ **0.70**
+  - Confusion matrix (rows = true, cols = predicted):
+
+    \[
+    \begin{bmatrix}
+    1 & 1 & 1 \\
+    0 & 2 & 0 \\
+    0 & 0 & 2
+    \end{bmatrix}
+    \]
+
+- Artifacts:
+  - `results/state_3class/best_state_dict.pt`
+  - `results/state_3class/metrics.npz`
+  - `results/state_3class/confusion_matrix.png`
+
+### 4.3 Binary planking detection (rest vs plank)
+
+Command:
+
+```bash
+python src/train_march_state_torch.py \
+  --data march_sbp_dataset.npz \
+  --mode binary \
+  --seed 42 \
+  --save-dir results/state_binary \
+  --plot
+```
+
+Summary of one run (with class weighting and balanced sampling):
+
+- Validation:
+  - **ACC** = **1.00**
+  - **Macro‑F1** = **1.00**
+- Test:
+  - **ACC** = **1.00**
+  - **Macro‑F1** = **1.00**
+  - Confusion matrix (rows = true, cols = predicted):
+
+    \[
+    \begin{bmatrix}
+    5 & 0 \\
+    0 & 2
+    \end{bmatrix}
+    \]
+
+- Artifacts:
+  - `results/state_binary/best_state_dict.pt`
+  - `results/state_binary/metrics.npz`
+  - `results/state_binary/confusion_matrix.png`
 
