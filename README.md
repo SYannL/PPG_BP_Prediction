@@ -36,8 +36,7 @@ PPG_BP_Prediction/
 │   ├── train_march_sbp_torch.py           # SBP regression (PPG + HR)
 │   └── train_march_state_torch.py         # posture / planking classifier
 ├── requirements.txt
-├── .gitignore
-└── (no Colab-specific README)
+└── .gitignore
 ```
 
 ---
