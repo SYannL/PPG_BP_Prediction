@@ -1,6 +1,6 @@
-#  PPG → SBP 
+#  Exploring Wearable Photoplethysmography for Autonomic Dysreflexia Detection
 
-This repository is a reproducible project for APSC 598P:
+This repository is the DL part of UnderPressure for APSC 598P:
 
 - Preprocessing: `PPG(finger+wrist) + HR → SBP`
 - Nature-style preprocessing visualizations (PNG)
