@@ -48,6 +48,13 @@ PPG_BP_Prediction/
 python -m pip install -r requirements.txt
 ```
 
+We **strongly recommend using a GPU device** (e.g. CUDA on a local machine or Google Colab)
+for all training commands below.
+
+Alternatively, you can open the Jupyter notebook `src/run.ipynb` and execute
+the cells sequentially, following the inline instructions, to reproduce the
+full preprocessing, visualization, and training pipeline end‑to‑end.
+
 ### Preprocess (outputs NPZ)
 
 ```bash
@@ -60,16 +67,32 @@ python src/preprocess_march_sbp.py --march-dir data/derived --out march_sbp_data
 python src/visualize_march_preprocess.py --march-dir data/derived --out-dir figures --seed 42
 ```
 
-### Train (GPU/CPU)
+### Train SBP regression (GPU)
 
 ```bash
-python src/train_march_sbp_torch.py --data march_sbp_dataset.npz --seed 42
+python src/train_march_sbp_torch.py --data march_sbp_dataset.npz --seed 42 --save-dir results/all_train --plot
 ```
 
-To force CPU:
+### Train three‑class posture classifier (sit / lay / plank, GPU)
 
 ```bash
-python src/train_march_sbp_torch.py --data march_sbp_dataset.npz --seed 42 --cpu
+python src/train_march_state_torch.py \
+  --data march_sbp_dataset.npz \
+  --mode three_class \
+  --seed 42 \
+  --save-dir results/state_3class \
+  --plot
+```
+
+### Train binary planking detector (rest vs plank, GPU)
+
+```bash
+python src/train_march_state_torch.py \
+  --data march_sbp_dataset.npz \
+  --mode binary \
+  --seed 42 \
+  --save-dir results/state_binary \
+  --plot
 ```
 
 ---
@@ -375,13 +398,13 @@ Summary of one run:
   - **Macro‑F1** ≈ **0.70**
   - Confusion matrix (rows = true, cols = predicted):
 
-    \[
-    \begin{bmatrix}
-    1 & 1 & 1 \\
-    0 & 2 & 0 \\
-    0 & 0 & 2
-    \end{bmatrix}
-    \]
+```math
+\begin{bmatrix}
+1 & 1 & 1 \\
+0 & 2 & 0 \\
+0 & 0 & 2
+\end{bmatrix}
+```
 
 - Artifacts:
   - `results/state_3class/best_state_dict.pt`
@@ -411,12 +434,12 @@ Summary of one run (with class weighting and balanced sampling):
   - **Macro‑F1** = **1.00**
   - Confusion matrix (rows = true, cols = predicted):
 
-    \[
-    \begin{bmatrix}
-    5 & 0 \\
-    0 & 2
-    \end{bmatrix}
-    \]
+```math
+\begin{bmatrix}
+5 & 0 \\
+0 & 2
+\end{bmatrix}
+```
 
 - Artifacts:
   - `results/state_binary/best_state_dict.pt`
