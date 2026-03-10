@@ -29,7 +29,7 @@ PPG_BP_Prediction/
 ├── src/
 │   ├── run.ipynb                          # end-to-end Jupyter pipeline
 │   ├── preprocess_march_sbp.py            # build march_sbp_dataset.npz
-│   ├── visualize_march_preprocess.py      # Nature-style preprocessing figures
+│   ├── visualize_march_preprocess.py      # visualization
 │   ├── convert_imuppg_bin_to_csv.py       # single-file bin → CSV converter
 │   ├── convert_march_raw_to_ppg_csv.py    # batch raw/ → ppg_csv/ converter
 │   ├── build_march_tables_from_xlsx.py    # Excel + CSV → derived/ tables
