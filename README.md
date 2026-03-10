@@ -228,17 +228,90 @@ In addition to predicting SBP, we use essentially the **same PPG + HR backbone**
       - How many planking sessions were correctly/incorrectly classified.
   - The script can also save a **PNG image of the confusion matrix**, which is easy to show in slides to non‑technical collaborators.
 
-### 3.4 How to explain this to non‑CS collaborators
+### 3.4 Model architecture and training details (CS‑oriented)
 
-In simple terms you can say:
+This subsection gives a more formal, implementation‑level description of the core models.
 
-- We record **pulse waveforms from the finger and wrist** plus **heart rate** while people sit, lie down, or do planking, and we measure their blood pressure.
-- We then:
-  - Clean and standardize the signals so that recordings are comparable.
-  - Feed them into a **neural network** that learns typical waveform shapes and how they relate to blood pressure and posture.
-- For blood pressure, the model learns to output a **number** (SBP).
-- For planking detection, the model learns to output whether the person is in a **resting posture** or **planking**, with special care taken so that:
-  - The much rarer planking sessions are not ignored.
-  - The model is tested on a separate held‑out set so the reported accuracy is realistic.
+- **Input representation**
+  - `X ∈ ℝ^{N×T×4}` with `T = 600`:
+    - Channel order: `[finger_IR, finger_red, wrist_IR, wrist_red]`.
+  - `hr ∈ ℝ^{N×1}`: scalar HR per sample (global z‑score).
+  - For all models, inputs are stored and fed as `float32`.
 
+- **PPG branch (`PpgBranch`)**
+  - Each branch sees 2 channels (either finger or wrist): `x ∈ ℝ^{N×T×2}`.
+  - Convolutional stem (implemented as `Conv1d` on `(N, C, T)`):
+    - `Conv1d(2 → d_model, kernel_size=9, padding=4)` + GELU + `BatchNorm1d(d_model)`
+    - `Conv1d(d_model → d_model, kernel_size=5, padding=2)` + GELU + `BatchNorm1d(d_model)`
+  - Positional encoding:
+    - Learnable tensor `pos ∈ ℝ^{1×T_max×d_model}`, with `T_max = 600`.
+    - Added element‑wise to the time dimension after the stem.
+  - Temporal encoder: stack of `n_layers` Transformer blocks:
+    - Each block uses pre‑norm **Multi‑Head Self‑Attention** and a 2‑layer feed‑forward network:
+      - LayerNorm(d_model)
+      - `MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)`
+      - Residual connection + Dropout
+      - LayerNorm(d_model)
+      - `Linear(d_model → d_model * ff_mult)` + GELU + Dropout + `Linear(d_model * ff_mult → d_model)`
+      - Second residual connection + Dropout
+  - Temporal aggregation (attention pooling):
+    - A single linear layer `score: ℝ^{d_model} → ℝ` applied at each time step.
+    - Attention weights via softmax over time, used to form a weighted sum:
+      - `w_t = softmax(score(h_t))`
+      - `z = Σ_t w_t h_t ∈ ℝ^{d_model}`.
+
+- **SBP regression head (`train_march_sbp_torch.py`)**
+  - Two PPG branches:
+    - `z_finger, z_wrist ∈ ℝ^{d_model}` from the finger and wrist branches.
+  - HR sub‑network:
+    - `hr ∈ ℝ^{N×1}` → `Linear(1 → 32)` → GELU → `Linear(32 → 32)` → `h_hr ∈ ℝ^{N×32}`.
+  - Concatenation:
+    - `z = concat(z_finger, z_wrist, h_hr) ∈ ℝ^{N×(2*d_model+32)}`.
+  - Regression head:
+    - LayerNorm(2*d_model + 32)
+    - `Linear(2*d_model + 32 → 128)` → GELU → Dropout
+    - `Linear(128 → 1)` → output SBP (scalar per sample).
+  - Default hyper‑parameters:
+    - `d_model = 96`
+    - `n_layers = 3`
+    - `n_heads = 4`
+    - `ff_mult = 4`
+    - `dropout ≈ 0.20`
+
+- **SBP training configuration**
+  - Loss: `HuberLoss(delta = 1.0)` between predicted and standardized SBP.
+  - Optimizer: `AdamW(lr = 2e-4, weight_decay = 1e-3)`.
+  - Learning‑rate schedule: `CosineAnnealingLR(T_max = epochs)`.
+  - Batch size: 8, with gradient clipping at `max_norm = 1.0`.
+  - Early stopping: patience ≈ 35 epochs based on validation error.
+  - Metrics: MAE, RMSE, and R² computed after de‑standardizing SBP.
+
+- **State / planking classifier (`train_march_state_torch.py`)**
+  - Backbone:
+    - Reuses exactly the same dual‑branch PPG encoder and HR sub‑network as SBP regression.
+  - Output head:
+    - Same concatenation `z ∈ ℝ^{N×(2*d_model+32)}`.
+    - LayerNorm(2*d_model + 32)
+    - `Linear(2*d_model + 32 → 128)` → GELU → Dropout
+    - `Linear(128 → K)` where `K = 2` (binary `rest` vs `plank`) or `K = 3` (sit / lay / plank).
+    - Softmax is applied implicitly by `CrossEntropyLoss`.
+  - Train/val/test split:
+    - Single‑shot split on sample indices:
+      - First, stratified `train+val` vs `test` with `test_ratio` (default 0.2).
+      - Then, stratified split of `train+val` into `train` and `val` using a relative `val_ratio`.
+    - Stratification uses the class labels so that all three sets preserve class proportions.
+  - Class imbalance handling:
+    - Class weights:
+      - Compute inverse‑frequency weights `inv_freq` from label counts and soften with exponent `γ = 0.5`.
+      - Normalize so that the average weight is approximately 1.
+      - Pass these weights to `CrossEntropyLoss(weight=...)`.
+    - Balanced sampling on the training set:
+      - For each epoch, oversample each class (especially the minority `plank`) to the size of the largest class.
+      - Construct a balanced index list for mini‑batch training.
+  - Optimization:
+    - Same optimizer and cosine schedule as SBP.
+    - Loss: `CrossEntropyLoss` with class weights.
+    - Metrics:
+      - Validation: accuracy and macro‑F1.
+      - Test: accuracy, macro‑F1, and confusion matrices for both validation and test sets.
 
