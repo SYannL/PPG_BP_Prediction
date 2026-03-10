@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+
+# Data (do not commit by default)
+data/derived/*.csv
+data/ppg_csv/**/*.csv
+data/raw/**/*.bin
+data/raw/**/*.b
+data/raw/**/*.xlsx
+
+# Outputs
+figures/
+*.npz
+
+# Matplotlib cache
+.mpl_cache/
