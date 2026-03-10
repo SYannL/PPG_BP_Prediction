@@ -52,6 +52,12 @@ Alternatively, you can open the Jupyter notebook `src/run.ipynb` and execute
 the cells sequentially, following the inline instructions, to reproduce the
 full preprocessing, visualization, and training pipeline end‑to‑end.
 
+### Run from the Jupyter notebook (`src/run.ipynb`)
+
+If you prefer a notebook workflow, open `PPG_BP_Prediction/src/run.ipynb` and run it **top‑to‑bottom**. If you are using Google Colab, upload the entire project folder to Google Drive, ensure the working directory matches this repository layout (paths under `data/`, `src/`, and `results/`), and then run the notebook from top to bottom.
+
+
+
 ### Preprocess (outputs NPZ)
 
 ```bash
