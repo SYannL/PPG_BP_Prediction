@@ -64,7 +64,7 @@ def main() -> None:
     y_delta, keep = compute_delta_sbp(y, group, state)
     X = X[keep]
     hr = hr[keep]
-    y_delta = y_delta[keep]  # 只保留有 baseline 的样本
+    y_delta = y_delta[keep]
     print(f"Data: X {X.shape}, hr {hr.shape}, y ΔSBP (dropped {(~keep).sum()})")
 
     N = len(y_delta)
