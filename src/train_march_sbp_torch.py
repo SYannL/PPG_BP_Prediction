@@ -116,25 +116,47 @@ class PpgBranch(nn.Module):
         return self.pool(x)
 
 
+PPG_MODE_FULL = "full"
+PPG_MODE_FINGER = "finger"
+PPG_MODE_WRIST = "wrist"
+
+
+def _head_in_dim(ppg_mode: str, d_model: int, has_hr: bool = True) -> int:
+    n_ppg = d_model * 2 if ppg_mode == PPG_MODE_FULL else d_model
+    return n_ppg + (32 if has_hr else 0)
+
+
 class Model(nn.Module):
-    def __init__(self, d_model: int = 96, n_layers: int = 3, n_heads: int = 4, dropout: float = 0.20):
+    def __init__(
+        self,
+        ppg_mode: str = PPG_MODE_FULL,
+        d_model: int = 96,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        dropout: float = 0.20,
+    ):
         super().__init__()
+        self.ppg_mode = ppg_mode
         self.finger = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
         self.wrist = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
         self.hr_mlp = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 32))
+        head_in = _head_in_dim(ppg_mode, d_model, has_hr=True)
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model * 2 + 32),
-            nn.Linear(d_model * 2 + 32, 128),
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, 128),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(128, 1),
         )
 
     def forward(self, x: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
-        f = self.finger(x[:, :, 0:2])
-        w = self.wrist(x[:, :, 2:4])
-        h = self.hr_mlp(hr)
-        return self.head(torch.cat([f, w, h], dim=-1)).squeeze(-1)
+        parts: list[torch.Tensor] = []
+        if self.ppg_mode in (PPG_MODE_FULL, PPG_MODE_FINGER):
+            parts.append(self.finger(x[:, :, 0:2]))
+        if self.ppg_mode in (PPG_MODE_FULL, PPG_MODE_WRIST):
+            parts.append(self.wrist(x[:, :, 2:4]))
+        parts.append(self.hr_mlp(hr))
+        return self.head(torch.cat(parts, dim=-1)).squeeze(-1)
 
 
 @dataclass(frozen=True)
@@ -202,8 +224,9 @@ def train_all(
     cfg: TrainConfig,
     device: torch.device,
     val_ratio: float,
+    ppg_mode: str = PPG_MODE_FULL,
 ) -> Dict[str, object]:
-    model = Model().to(device)
+    model = Model(ppg_mode=ppg_mode).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.HuberLoss(delta=cfg.huber_delta)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(cfg.epochs, 1))
@@ -274,30 +297,69 @@ def train_all(
     }
 
 
+def load_npz(path: Path) -> tuple:
+    """Load NPZ and return (X, hr, y). hr 若已 z-score 则保持，否则不处理。"""
+    z = np.load(path, allow_pickle=True)
+    X = z["X"].astype(np.float32)
+    hr = z["hr"].astype(np.float32)
+    y = z["y"].astype(np.float32)
+    return X, hr, y
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, default="march_sbp_dataset.npz")
+    p.add_argument(
+        "--data",
+        type=str,
+        default="march_sbp_dataset.npz",
+        help="Single NPZ path, or comma-separated paths for combined training (e.g. march.npz,data/eval/ppg2026_dataset.npz)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--val-ratio", type=float, default=0.2, help="Random validation split ratio")
     p.add_argument("--shuffle-labels", action="store_true", help="Shuffle labels (sanity check)")
     p.add_argument("--save-dir", type=str, default=None, help="If set, save best model (.pt) and metrics (.npz)")
     p.add_argument("--plot", action="store_true", help="Save train/val loss curves into save-dir (PNG)")
+    p.add_argument(
+        "--ppg-mode",
+        type=str,
+        default="full",
+        choices=["full", "finger", "wrist"],
+        help="PPG input: full=both finger+wrist, finger=finger only, wrist=wrist only",
+    )
     args = p.parse_args()
 
     cfg = TrainConfig(seed=args.seed)
     set_seed(cfg.seed)
     device = get_device(force_cpu=args.cpu)
-    print(f"Device: {device} (cuda_available={torch.cuda.is_available()})")
+    print(f"Device: {device} (cuda_available={torch.cuda.is_available()}) ppg_mode={args.ppg_mode}")
 
-    z = np.load(Path(args.data), allow_pickle=True)
-    X = z["X"]
-    hr = z["hr"]
-    y = z["y"]
+    # 支持单数据集或逗号分隔的多数据集
+    paths = [p.strip() for p in args.data.split(",") if p.strip()]
+    if not paths:
+        raise ValueError("--data must specify at least one NPZ path")
+    X_list, hr_list, y_list = [], [], []
+    for path in paths:
+        Xp, hrp, yp = load_npz(Path(path))
+        X_list.append(Xp)
+        hr_list.append(hrp)
+        y_list.append(yp)
+        print(f"  Loaded {path}: X {Xp.shape}, hr {hrp.shape}, y {yp.shape}")
+    X = np.concatenate(X_list, axis=0)
+    hr = np.concatenate(hr_list, axis=0)
+    y = np.concatenate(y_list, axis=0)
+    # 合并后统一对 hr 做 z-score
+    hr_mean = float(np.nanmean(hr))
+    hr_std = float(np.nanstd(hr))
+    if hr_std < 1e-6:
+        hr_std = 1.0
+    hr = (hr - hr_mean) / hr_std
+    print(f"Combined: X {X.shape}, hr {hr.shape}, y {y.shape} (hr re-zscored)")
+
     if args.shuffle_labels:
         y = shuffle_labels(y, seed=args.seed)
 
-    out = train_all(X, hr, y, cfg, device, val_ratio=float(args.val_ratio))
+    out = train_all(X, hr, y, cfg, device, val_ratio=float(args.val_ratio), ppg_mode=args.ppg_mode)
     print("-" * 60)
     print(f"VAL: MAE={out['val_mae']:.3f}, RMSE={out['val_rmse']:.3f}, R2={out['val_r2']:.3f}")
 
@@ -313,6 +375,8 @@ def main() -> None:
             seed=np.array([args.seed], int),
             shuffle_labels=np.array([args.shuffle_labels], bool),
             val_ratio=np.array([args.val_ratio], float),
+            ppg_mode=np.array([args.ppg_mode], dtype=object),
+            data_paths=np.array(paths, dtype=object),
         )
         print(f"Wrote {sd/'best_state_dict.pt'} and {sd/'metrics.npz'}")
         if args.plot and plt is not None:

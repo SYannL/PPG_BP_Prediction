@@ -52,9 +52,9 @@ def get_device(force_cpu: bool = False) -> torch.device:
 
 def _norm_state(s: str) -> str:
     s = str(s).strip().lower()
-    if "plank" in s:
+    if "plank" in s or "wallsit" in s:
         return "plank"
-    if s in {"sit", "sitting"}:
+    if s in {"sit", "sitting"} or s == "rest":
         return "sit"
     if s in {"lay", "lying", "lie"}:
         return "lay"
@@ -157,25 +157,48 @@ class PpgBranch(nn.Module):
         return self.pool(x)
 
 
+PPG_MODE_FULL = "full"
+PPG_MODE_FINGER = "finger"
+PPG_MODE_WRIST = "wrist"
+
+
+def _head_in_dim(ppg_mode: str, d_model: int, has_hr: bool = True) -> int:
+    n_ppg = d_model * 2 if ppg_mode == PPG_MODE_FULL else d_model
+    return n_ppg + (32 if has_hr else 0)
+
+
 class StateModel(nn.Module):
-    def __init__(self, n_classes: int, d_model: int = 96, n_layers: int = 3, n_heads: int = 4, dropout: float = 0.20):
+    def __init__(
+        self,
+        n_classes: int,
+        ppg_mode: str = PPG_MODE_FULL,
+        d_model: int = 96,
+        n_layers: int = 3,
+        n_heads: int = 4,
+        dropout: float = 0.20,
+    ):
         super().__init__()
+        self.ppg_mode = ppg_mode
         self.finger = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
         self.wrist = PpgBranch(in_ch=2, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
         self.hr_mlp = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 32))
+        head_in = _head_in_dim(ppg_mode, d_model, has_hr=True)
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model * 2 + 32),
-            nn.Linear(d_model * 2 + 32, 128),
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, 128),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(128, n_classes),
         )
 
     def forward(self, x: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
-        f = self.finger(x[:, :, 0:2])
-        w = self.wrist(x[:, :, 2:4])
-        h = self.hr_mlp(hr)
-        return self.head(torch.cat([f, w, h], dim=-1))  # logits (B,K)
+        parts: list[torch.Tensor] = []
+        if self.ppg_mode in (PPG_MODE_FULL, PPG_MODE_FINGER):
+            parts.append(self.finger(x[:, :, 0:2]))
+        if self.ppg_mode in (PPG_MODE_FULL, PPG_MODE_WRIST):
+            parts.append(self.wrist(x[:, :, 2:4]))
+        parts.append(self.hr_mlp(hr))
+        return self.head(torch.cat(parts, dim=-1))  # logits (B,K)
 
 
 @dataclass(frozen=True)
@@ -206,8 +229,9 @@ def train_with_indices(
     device: torch.device,
     n_classes: int,
     class_weights: np.ndarray | None = None,
+    ppg_mode: str = PPG_MODE_FULL,
 ) -> Dict[str, object]:
-    model = StateModel(n_classes=n_classes).to(device)
+    model = StateModel(n_classes=n_classes, ppg_mode=ppg_mode).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     if class_weights is not None:
         w = torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -300,9 +324,19 @@ def train_with_indices(
     }
 
 
+def load_npz_state(path: Path) -> tuple:
+    z = np.load(path, allow_pickle=True)
+    return z["X"].astype(np.float32), z["hr"].astype(np.float32), z["state"]
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, default="march_sbp_dataset.npz")
+    p.add_argument(
+        "--data",
+        type=str,
+        default="march_sbp_dataset.npz",
+        help="Single NPZ path, or comma-separated paths for combined training",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--mode", type=str, default="three_class", choices=["three_class", "binary"])
@@ -311,17 +345,39 @@ def main() -> None:
     p.add_argument("--shuffle-labels", action="store_true", help="Shuffle labels (sanity check)")
     p.add_argument("--save-dir", type=str, default=None, help="If set, save best model (.pt) and metrics (.npz)")
     p.add_argument("--plot", action="store_true", help="Save confusion matrix figure into save-dir (PNG)")
+    p.add_argument(
+        "--ppg-mode",
+        type=str,
+        default="full",
+        choices=["full", "finger", "wrist"],
+        help="PPG input: full=both finger+wrist, finger=finger only, wrist=wrist only",
+    )
     args = p.parse_args()
 
     cfg = TrainConfig(seed=args.seed)
     set_seed(cfg.seed)
     device = get_device(force_cpu=args.cpu)
-    print(f"Device: {device} (cuda_available={torch.cuda.is_available()})")
+    print(f"Device: {device} (cuda_available={torch.cuda.is_available()}) ppg_mode={args.ppg_mode}")
 
-    z = np.load(Path(args.data), allow_pickle=True)
-    X = z["X"].astype(np.float32)
-    hr = z["hr"].astype(np.float32)
-    state = z["state"]
+    paths = [p.strip() for p in args.data.split(",") if p.strip()]
+    if not paths:
+        raise ValueError("--data must specify at least one NPZ path")
+    X_list, hr_list, state_list = [], [], []
+    for path in paths:
+        Xp, hrp, stp = load_npz_state(Path(path))
+        X_list.append(Xp)
+        hr_list.append(hrp)
+        state_list.append(stp)
+        print(f"  Loaded {path}: X {Xp.shape}, hr {hrp.shape}, state {len(stp)}")
+    X = np.concatenate(X_list, axis=0)
+    hr = np.concatenate(hr_list, axis=0)
+    state = np.concatenate([np.asarray(s).ravel() for s in state_list], axis=0)
+    hr_mean = float(np.nanmean(hr))
+    hr_std = float(np.nanstd(hr))
+    if hr_std < 1e-6:
+        hr_std = 1.0
+    hr = (hr - hr_mean) / hr_std
+    print(f"Combined: X {X.shape}, hr {hr.shape}, state {len(state)} (hr re-zscored)")
 
     y_cls, class_names = _encode_states(state, mode=args.mode)
     if args.shuffle_labels:
@@ -372,6 +428,7 @@ def main() -> None:
         device=device,
         n_classes=len(class_names),
         class_weights=class_weights,
+        ppg_mode=args.ppg_mode,
     )
     print("-" * 60)
     print(f"MODE={args.mode} classes={class_names}")
@@ -379,7 +436,7 @@ def main() -> None:
 
     # final evaluation on held-out test set
     model_state = out["best_state_dict"]
-    model = StateModel(n_classes=len(class_names)).to(device)
+    model = StateModel(n_classes=len(class_names), ppg_mode=args.ppg_mode).to(device)
     model.load_state_dict(model_state, strict=True)
     model.eval()
     with torch.no_grad():
@@ -417,6 +474,8 @@ def main() -> None:
             test_index=np.array(te_idx, int),
             test_true=np.array(y_te, int),
             test_pred=np.array(y_pred_te, int),
+            ppg_mode=np.array([args.ppg_mode], dtype=object),
+            data_paths=np.array(paths, dtype=object),
         )
         print(f"Wrote {sd/'best_state_dict.pt'} and {sd/'metrics.npz'}")
 
