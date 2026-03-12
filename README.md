@@ -37,10 +37,13 @@ PPG_BP_Prediction/
 │   ├── build_march_tables_from_xlsx.py    # Excel + CSV → derived/ tables
 │   ├── train_march_sbp_torch.py           # SBP regression (PPG + HR)
 │   ├── train_march_sbp_ppg_only_torch.py  # SBP regression (PPG only, no HR)
+│   ├── train_sbp_delta_torch.py           # ΔSBP regression (PPG + HR)
+│   ├── train_sbp_delta_ppg_only_torch.py  # ΔSBP regression (PPG only)
 │   ├── train_march_state_torch.py         # posture / planking classifier
 │   ├── train_march_state_ppg_only_torch.py# posture classifier (PPG only, no HR)
 │   └── eval/                              # evaluation & external data conversion
 │       ├── eval_march_sbp.py              # evaluate trained SBP model on NPZ
+│       ├── eval_sbp_delta.py              # evaluate trained ΔSBP model
 │       └── preprocess_ppg2026_to_march.py # convert ppg2026 → March npz
 ├── requirements.txt
 └── .gitignore
@@ -176,6 +179,44 @@ Load weights and evaluate on any March-format NPZ:
 python src/eval/eval_march_sbp.py --data march_sbp_dataset.npz --ckpt results/all_train/best_state_dict.pt
 ```
 
+### ΔSBP (差值预测) — 预测血压相对基线的变化
+
+针对“血压突然升高”等临床场景，预测 **ΔSBP = SBP - 个人 rest 基线**，而非绝对 SBP。NPZ 需含 `group`、`state`；baseline = 该 subject 在 rest 阶段 (sit/lay/rest) 的 SBP 均值。
+
+**训练：**
+
+```bash
+# PPG + HR
+python src/train_sbp_delta_torch.py \
+  --data data/eval/ppg2026_dataset.npz \
+  --save-dir results/sbp_delta \
+  --val-ratio 0.2 --plot
+
+# PPG only
+python src/train_sbp_delta_ppg_only_torch.py \
+  --data data/eval/ppg2026_dataset.npz \
+  --save-dir results/sbp_delta_ppg_only --plot
+
+# Multi-dataset
+python src/train_sbp_delta_torch.py \
+  --data march_sbp_dataset.npz,data/eval/ppg2026_dataset.npz \
+  --save-dir results/sbp_delta_combined --plot
+```
+
+**Evaluate:**
+
+```bash
+python src/eval/eval_sbp_delta.py \
+  --data data/eval/ppg2026_dataset.npz \
+  --ckpt results/sbp_delta/best_state_dict.pt
+
+# PPG-only model
+python src/eval/eval_sbp_delta.py --data data/eval/ppg2026_dataset.npz \
+  --ckpt results/sbp_delta_ppg_only/best_state_dict.pt --no-hr
+```
+
+ΔSBP models use a smaller config (d_model=64, n_layers=2, dropout=0.35) and data augmentation for few-shot regimes. Override with `--d-model`, `--n-layers`, `--dropout`, etc.
+
 ### Preprocess ppg2026 (BP_Cuff + finger + wrist) to March format
 
 If you have `QTPY/bp_prediction/dataset/ppg2026` with `BP_Cuff.xlsx` and `aligned/*.csv`
@@ -305,6 +346,15 @@ This section explains **what the pipeline does conceptually**, without going int
     - **MAE** (mean absolute error)
     - **RMSE** (root mean squared error)
     - **R²** (coefficient of determination)
+
+### 3.2a ΔSBP (change-from-baseline) model
+
+- **Goal**: Predict **ΔSBP = SBP − baseline** instead of absolute SBP. Baseline = mean SBP of rest-state samples for the same subject.
+- **Use case**: Detecting sudden blood pressure rises (e.g., autonomic dysreflexia), aligned with clinical monitoring.
+- **Ground truth**: Computed from cuff measurements: baseline = mean(SBP of rest samples), ΔSBP = current SBP − baseline.
+- **Scripts**: `train_sbp_delta_torch.py`, `train_sbp_delta_ppg_only_torch.py`.
+- **Few-shot tuning**: Default d_model=64, n_layers=2, dropout=0.35, plus noise and time-shift augmentation.
+- **Evaluation**: `eval_sbp_delta.py` reports MAE, RMSE, R² (units: ΔmmHg).
 
 ### 3.3 Posture / planking classification model
 
