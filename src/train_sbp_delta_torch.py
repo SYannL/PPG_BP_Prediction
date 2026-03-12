@@ -18,7 +18,29 @@ import torch
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from train_march_sbp_torch import PPG_MODE_FULL, Model, TrainConfig, get_device, set_seed, shuffle_labels
+from dataclasses import dataclass
+
+from train_march_sbp_torch import PPG_MODE_FULL, Model, get_device, set_seed, shuffle_labels
+
+
+@dataclass(frozen=True)
+class DeltaTrainConfig:
+    """小样本优化：更小模型、更强正则、数据增强。"""
+    epochs: int = 200
+    batch_size: int = 8
+    lr: float = 1e-4
+    weight_decay: float = 0.02
+    patience: int = 20
+    seed: int = 42
+    huber_delta: float = 10.0  # ΔSBP 尺度约 ±50，delta 放宽
+    d_model: int = 64
+    n_layers: int = 2
+    n_heads: int = 4
+    dropout: float = 0.35
+    augment: bool = True
+    aug_noise: float = 0.05
+    aug_shift: int = 30
+
 
 try:
     import matplotlib.pyplot as plt
@@ -57,24 +79,55 @@ def _to_tensor(x: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.tensor(x, dtype=torch.float32, device=device)
 
 
+def _augment(xb: torch.Tensor, noise_std: float = 0.05, max_shift: int = 30) -> torch.Tensor:
+    """轻量数据增强，缓解小样本过拟合。"""
+    if noise_std > 0:
+        xb = xb + torch.randn_like(xb, device=xb.device) * noise_std
+    if max_shift > 0:
+        B, T, C = xb.shape
+        shifts = torch.randint(-max_shift, max_shift + 1, (B,), device=xb.device)
+        out = xb.clone()
+        for i in range(B):
+            s = int(shifts[i].item())
+            if s == 0:
+                continue
+            if s > 0:
+                out[i, s:] = xb[i, :-s]
+                out[i, :s] = xb[i, 0:1].expand(s, C)
+            else:
+                s = -s
+                out[i, :-s] = xb[i, s:]
+                out[i, -s:] = xb[i, -1:].expand(s, C)
+        xb = out
+    return xb
+
+
 def train_all(
     X: np.ndarray,
     hr: np.ndarray,
     y: np.ndarray,
-    cfg: TrainConfig,
+    cfg: "DeltaTrainConfig",
     device: torch.device,
     val_ratio: float,
     ppg_mode: str = PPG_MODE_FULL,
 ) -> Dict:
     from torch import nn
 
-    model = Model(ppg_mode=ppg_mode).to(device)
+    model = Model(
+        ppg_mode=ppg_mode,
+        d_model=cfg.d_model,
+        n_layers=cfg.n_layers,
+        n_heads=cfg.n_heads,
+        dropout=cfg.dropout,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.HuberLoss(delta=cfg.huber_delta)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(cfg.epochs, 1))
 
     idx = np.arange(len(y))
-    tr_idx, va_idx = train_test_split(idx, test_size=val_ratio, random_state=cfg.seed, shuffle=True)
+    tr_idx, va_idx = train_test_split(
+        idx, test_size=val_ratio, random_state=cfg.seed, shuffle=True, stratify=None
+    )
     Xtr, Htr, Ytr = X[tr_idx], hr[tr_idx], y[tr_idx]
     Xva, Hva, Yva = X[va_idx], hr[va_idx], y[va_idx]
 
@@ -88,7 +141,10 @@ def train_all(
         losses = []
         for s in range(0, len(tr_idx), cfg.batch_size):
             b = order[s : s + cfg.batch_size]
-            pred = model(_to_tensor(Xtr[b], device), _to_tensor(Htr[b], device))
+            xb = _to_tensor(Xtr[b], device)
+            if cfg.augment:
+                xb = _augment(xb, noise_std=cfg.aug_noise, max_shift=cfg.aug_shift)
+            pred = model(xb, _to_tensor(Htr[b], device))
             loss = loss_fn(pred, _to_tensor(Ytr[b], device))
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -144,9 +200,25 @@ def main() -> None:
     p.add_argument("--save-dir", type=str, default=None)
     p.add_argument("--plot", action="store_true")
     p.add_argument("--ppg-mode", type=str, default="full", choices=["full", "finger", "wrist"])
+    p.add_argument("--d-model", type=int, default=64, help="Smaller for few samples (default 64)")
+    p.add_argument("--n-layers", type=int, default=2, help="Fewer layers (default 2)")
+    p.add_argument("--dropout", type=float, default=0.35, help="Higher dropout (default 0.35)")
+    p.add_argument("--lr", type=float, default=1e-4, help="Lower LR (default 1e-4)")
+    p.add_argument("--weight-decay", type=float, default=0.02, help="Stronger L2 (default 0.02)")
+    p.add_argument("--patience", type=int, default=20, help="Earlier stop (default 20)")
+    p.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
     args = p.parse_args()
 
-    cfg = TrainConfig(seed=args.seed)
+    cfg = DeltaTrainConfig(
+        seed=args.seed,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
+        dropout=args.dropout,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        augment=not args.no_augment,
+    )
     set_seed(cfg.seed)
     device = get_device(force_cpu=args.cpu)
     print(f"Device: {device} ppg_mode={args.ppg_mode} [ΔSBP target]")
@@ -202,6 +274,10 @@ def main() -> None:
             ppg_mode=np.array([args.ppg_mode], dtype=object),
             data_paths=np.array(paths, dtype=object),
             target=np.array(["delta"], dtype=object),
+            d_model=np.array([cfg.d_model], int),
+            n_layers=np.array([cfg.n_layers], int),
+            n_heads=np.array([cfg.n_heads], int),
+            dropout=np.array([cfg.dropout], float),
         )
         print(f"Wrote {sd/'best_state_dict.pt'} and {sd/'metrics.npz'}")
         if args.plot and plt:

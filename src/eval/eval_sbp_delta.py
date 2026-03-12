@@ -19,19 +19,41 @@ from train_march_sbp_torch import Model, get_device, _to_tensor
 from train_march_sbp_ppg_only_torch import Model as ModelPpgOnly
 
 
+def _infer_arch_from_state(state: dict) -> tuple:
+    """从 checkpoint state_dict 推断 d_model、n_layers，确保与训练时一致。"""
+    # finger.pos / wrist.pos: [1, 600, d_model]
+    d_model = int(state["finger.pos"].shape[2])
+    # finger.blocks.0, blocks.1, ... 的最大索引 + 1
+    n_layers = 0
+    for k in state:
+        if k.startswith("finger.blocks.") and ".ln1.weight" in k:
+            idx = int(k.split(".")[2])
+            n_layers = max(n_layers, idx + 1)
+    if n_layers == 0:
+        n_layers = 3  # 兜底
+    return d_model, n_layers
+
+
 def load_model(ckpt_path: Path, no_hr: bool, ppg_mode: str, device: torch.device):
     ckpt_dir = ckpt_path.parent
     metrics_path = ckpt_dir / "metrics.npz"
     ppg_mode_loaded = ppg_mode
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    d_model, n_layers = _infer_arch_from_state(state)
+    n_heads, dropout = 4, 0.35
     if metrics_path.exists():
         m = np.load(metrics_path, allow_pickle=True)
         if "ppg_mode" in m:
             ppg_mode_loaded = str(m["ppg_mode"].item())
+        if "n_heads" in m:
+            n_heads = int(m["n_heads"].item())
+        if "dropout" in m:
+            dropout = float(m["dropout"].item())
+    kw = dict(ppg_mode=ppg_mode_loaded, d_model=d_model, n_layers=n_layers, n_heads=n_heads, dropout=dropout)
     if no_hr:
-        model = ModelPpgOnly(ppg_mode=ppg_mode_loaded).to(device)
+        model = ModelPpgOnly(**kw).to(device)
     else:
-        model = Model(ppg_mode=ppg_mode_loaded).to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        model = Model(**kw).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
     return model
