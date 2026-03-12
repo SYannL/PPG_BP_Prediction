@@ -179,11 +179,11 @@ Load weights and evaluate on any March-format NPZ:
 python src/eval/eval_march_sbp.py --data march_sbp_dataset.npz --ckpt results/all_train/best_state_dict.pt
 ```
 
-### ΔSBP (差值预测) — 预测血压相对基线的变化
+### ΔSBP (change-from-baseline) prediction
 
-针对“血压突然升高”等临床场景，预测 **ΔSBP = SBP - 个人 rest 基线**，而非绝对 SBP。NPZ 需含 `group`、`state`；baseline = 该 subject 在 rest 阶段 (sit/lay/rest) 的 SBP 均值。
+For clinical scenarios such as detecting sudden blood pressure rises, predict **ΔSBP = SBP − per-subject rest baseline** instead of absolute SBP. NPZ must contain `group` and `state`. Baseline = mean SBP of rest-state samples (sit/lay/rest) for each subject.
 
-**训练：**
+**Train:**
 
 ```bash
 # PPG + HR
