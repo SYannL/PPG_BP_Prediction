@@ -303,12 +303,49 @@ def train_and_eval(
     lr: float,
     weight_decay: float,
     patience: int,
+    mode: str,
+    test_scope: str,
 ) -> Dict[str, float]:
+    """
+    Split by original record index (not by segments) to avoid leakage.
+
+    - mode=split12: train/val/test all use 12 segments per record.
+    - mode=first5: train/val use only segment==0 (first 5s); test evaluates on *all 12 segments*
+      for each record in the original test split, plus record-level mean over 12 segments.
+    """
     X = ds["X"]
     y = ds["y"]
     hr = ds["hr"]
-    idx = np.arange(len(y))
-    tr_idx, va_idx = train_test_split(idx, test_size=0.2, random_state=seed, shuffle=True)
+    rec_index = ds["index"]
+    seg_id = ds["segment"]
+
+    uniq_rec = np.unique(rec_index)
+    tr_rec, te_rec = train_test_split(uniq_rec, test_size=0.2, random_state=seed, shuffle=True)
+    tr_rec, va_rec = train_test_split(tr_rec, test_size=0.2, random_state=seed + 1, shuffle=True)
+
+    def _train_seg_id(mode: str) -> int | None:
+        # segment id is defined on 5s blocks: 0=[0,5), 1=[5,10), ..., 5=[25,30)
+        if mode == "first5":
+            return 0
+        if mode == "sec25_30":
+            return 5
+        return None  # split12: use all segments
+
+    def sel(rec_ids: np.ndarray, only_seg: int | None) -> np.ndarray:
+        m = np.isin(rec_index, rec_ids)
+        if only_seg is not None:
+            m = m & (seg_id == only_seg)
+        return np.where(m)[0].astype(int)
+
+    only_seg = _train_seg_id(mode)
+    tr_idx = sel(tr_rec, only_seg=only_seg)
+    va_idx = sel(va_rec, only_seg=only_seg)
+    if test_scope == "all12":
+        te_idx = sel(te_rec, only_seg=None)  # test on every 5s segment in test set
+    elif test_scope == "same":
+        te_idx = sel(te_rec, only_seg=only_seg)  # test on the same 5s position
+    else:
+        raise ValueError(f"Unknown test_scope: {test_scope}")
 
     model = SmallRealtimeModel(in_ch=X.shape[-1], use_hr=use_hr).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -374,24 +411,33 @@ def train_and_eval(
 
     out = {"val_mae": mae, "val_rmse": rmse, "val_r2": r2}
 
-    # record-level aggregation for split12: average predictions within the same original index
-    if ds["segment"].max() > 0:
-        va_index = ds["index"][va_idx]
-        va_pred = pred
-        va_y = y[va_idx]
-        uniq = np.unique(va_index)
-        rec_pred = []
-        rec_y = []
-        for u in uniq:
-            m = va_index == u
-            rec_pred.append(float(np.mean(va_pred[m])))
-            # all labels identical within record by design; take first
-            rec_y.append(float(va_y[m][0]))
-        rec_pred = np.array(rec_pred, dtype=float)
-        rec_y = np.array(rec_y, dtype=float)
-        out["val_record_mae"] = float(mean_absolute_error(rec_y, rec_pred))
-        out["val_record_rmse"] = float(np.sqrt(mean_squared_error(rec_y, rec_pred)))
-        out["val_record_r2"] = float(r2_score(rec_y, rec_pred))
+    # test on the original test split (always all 12 segments per record)
+    model.eval()
+    with torch.no_grad():
+        xb = _to(X[te_idx], device)
+        if use_hr:
+            te_pred = model(xb, _to(hr[te_idx], device)).cpu().numpy()
+        else:
+            te_pred = model(xb, None).cpu().numpy()
+    out["test_mae"] = float(mean_absolute_error(y[te_idx], te_pred))
+    out["test_rmse"] = float(np.sqrt(mean_squared_error(y[te_idx], te_pred)))
+    out["test_r2"] = float(r2_score(y[te_idx], te_pred))
+
+    # record-level aggregation: average predictions within the same original record index
+    te_rec_index = rec_index[te_idx]
+    te_y = y[te_idx]
+    uniq = np.unique(te_rec_index)
+    rec_pred = []
+    rec_y = []
+    for u in uniq:
+        m = te_rec_index == u
+        rec_pred.append(float(np.mean(te_pred[m])))
+        rec_y.append(float(te_y[m][0]))  # label identical within record by design
+    rec_pred = np.array(rec_pred, dtype=float)
+    rec_y = np.array(rec_y, dtype=float)
+    out["test_record_mae"] = float(mean_absolute_error(rec_y, rec_pred))
+    out["test_record_rmse"] = float(np.sqrt(mean_squared_error(rec_y, rec_pred)))
+    out["test_record_r2"] = float(r2_score(rec_y, rec_pred))
 
     return out
 
@@ -399,7 +445,14 @@ def train_and_eval(
 def main() -> None:
     p = argparse.ArgumentParser(description="Realtime SBP experiment: 5s windows")
     p.add_argument("--march-dir", type=str, default="data/derived")
-    p.add_argument("--mode", type=str, default="split12", choices=["split12", "first5"])
+    p.add_argument("--mode", type=str, default="split12", choices=["split12", "first5", "sec25_30"])
+    p.add_argument(
+        "--test-scope",
+        type=str,
+        default="all12",
+        choices=["all12", "same"],
+        help="Test scope: all12=test all 12 segments per record; same=test only the same 5s position as training",
+    )
     p.add_argument("--downsample", type=int, default=2, help="Downsample factor from 50Hz (e.g. 2->25Hz, 5->10Hz)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
@@ -417,13 +470,18 @@ def main() -> None:
     cfg = ExpConfig(downsample_factor=int(args.downsample))
 
     print(f"Device: {device} mode={args.mode} window=5s fs_out={cfg.fs_out:.1f}Hz T={cfg.n_out}")
-    ds = build_realtime_dataset(Path(args.march_dir), cfg, mode=args.mode)
-    print(f"Dataset: X {ds['X'].shape}, y {ds['y'].shape}, hr {ds['hr'].shape}")
+    # Always build split12 so we can evaluate every 5s segment on the original test set.
+    # Training behavior depends on args.mode (first5 uses only segment==0 for train/val).
+    ds = build_realtime_dataset(Path(args.march_dir), cfg, mode="split12")
+    print(
+        f"Dataset (split12): X {ds['X'].shape}, y {ds['y'].shape}, hr {ds['hr'].shape} "
+        f"(records={len(np.unique(ds['index']))})"
+    )
 
     if args.save_dir:
         sd = Path(args.save_dir)
         sd.mkdir(parents=True, exist_ok=True)
-        out_path = sd / f\"realtime_{args.mode}_5s_ds{cfg.downsample_factor}.npz\"
+        out_path = sd / f"realtime_{args.mode}_5s_ds{cfg.downsample_factor}.npz"
         np.savez_compressed(out_path, **ds)
         print(f"Wrote {out_path}")
 
@@ -437,6 +495,17 @@ def main() -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         patience=int(args.patience),
+        mode=args.mode,
+        test_scope=args.test_scope,
     )
-    print(\"-\" * 60)
-    print(f\"VAL (segment): MAE={out['val_mae']:.3f} RMSE={out['val_rmse']:.3f} R2={out['val_r2']:.3f}\")\n+    if 'val_record_mae' in out:\n+        print(\n+            f\"VAL (record mean of 12 segments): MAE={out['val_record_mae']:.3f} \"\n+            f\"RMSE={out['val_record_rmse']:.3f} R2={out['val_record_r2']:.3f}\"\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    main()\n+
+    print("-" * 60)
+    print(f"VAL (segment):  MAE={out['val_mae']:.3f} RMSE={out['val_rmse']:.3f} R2={out['val_r2']:.3f}")
+    print(f"TEST (segment): MAE={out['test_mae']:.3f} RMSE={out['test_rmse']:.3f} R2={out['test_r2']:.3f}")
+    print(
+        f"TEST (record mean of 12 segments): MAE={out['test_record_mae']:.3f} "
+        f"RMSE={out['test_record_rmse']:.3f} R2={out['test_record_r2']:.3f}"
+    )
+
+
+if __name__ == "__main__":
+    main()
