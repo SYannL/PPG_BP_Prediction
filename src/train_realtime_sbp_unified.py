@@ -5,7 +5,8 @@ Only regression tasks:
   - sbp_abs: predict absolute SBP
   - sbp_delta: predict ΔSBP = SBP - per-subject rest-baseline SBP
 
-All splits are by original record `index` (no leakage between windows of the same record).
+When `--test-ratio` is set, splits are by original record `index` (no leakage between windows of the same record).
+When `--test-ratio` is not set, splits mimic `train_march_sbp_torch.py` and do window-level random train/val split.
 
 Windowing:
   - Input signals are taken from `data/derived/{finger.csv,wrist.csv,labels.csv}` (50 Hz, 60 s => 3000 points).
@@ -107,8 +108,21 @@ def _zscore_per_sample(x: np.ndarray, eps: float) -> np.ndarray:
 def _resample_to_t_out(x: np.ndarray, fs_in: float, duration_sec: float, t_out: int) -> np.ndarray:
     """
     x: (T_raw, C)
-    resample to exactly t_out points over the same duration via linear interpolation.
+    Resample to exactly t_out points over the same duration.
+
+    For the common case used by March preprocessing (50Hz -> 10Hz for 60s -> 600 points),
+    we must match the original downsampling behavior (stride slicing), not interpolation,
+    to ensure the realtime script is comparable with the preprocessed .npz pipeline.
     """
+    # If it divides cleanly, do stride downsampling to match preprocess_march_sbp.py.
+    # Example: 60s @ 50Hz => T_raw=3000, t_out=600 => stride=5 => x[::5] length=600.
+    if x.shape[0] == t_out:
+        return x.astype(np.float32, copy=False)
+    if t_out > 0 and (x.shape[0] % t_out == 0):
+        stride = x.shape[0] // t_out
+        # stride slicing keeps the same "endpoint excluded" timing convention.
+        return x[::stride, :].astype(np.float32, copy=False)
+
     t_raw = np.linspace(0.0, duration_sec, num=x.shape[0], endpoint=False, dtype=np.float64)
     # We'll sample equally spaced points excluding endpoint to mimic discrete sampling alignment.
     t_new = np.linspace(0.0, duration_sec, num=t_out, endpoint=False, dtype=np.float64)
@@ -172,8 +186,21 @@ def _make_window_starts(sec_start: float, sec_end: float, scope: WindowScope) ->
     if sec_start < 0 or sec_end <= sec_start or sec_end > 60.0:
         raise ValueError(f"Invalid --sec range: {sec_start} {sec_end} (must be in [0,60], end>start)")
     L = sec_end - sec_start
+
+    # Hard-case: full-minute should always be exactly one window starting at 0.
+    # This avoids float edge-cases that can lead to an empty "Allowed starts".
+    if abs(L - 60.0) <= 1e-6:
+        if scope == "all12":
+            return [0.0]
+        # scope == "same": require the requested start to be ~0
+        if abs(sec_start) <= 1e-6:
+            return [0.0]
+        # Otherwise, "same" doesn't align with full-minute's only window.
+        raise ValueError(
+            f"--sec start={sec_start} does not align with non-overlapping equal windows of length 60.0. Allowed starts: [0.0]"
+        )
     # Number of non-overlapping windows starting at 0
-    k = int(np.floor((60.0 - 1e-9) / L))
+    k = int(np.floor((60.0 + 1e-9) / L))
     all_starts = [i * L for i in range(k)]
     # Snap to near-equality due to float
     def _snap(x: float) -> float:
@@ -568,9 +595,9 @@ def train_validate_test(
     Xva: np.ndarray,
     hr_va: np.ndarray,
     yva: np.ndarray,
-    Xte: np.ndarray,
-    hr_te: np.ndarray,
-    yte: np.ndarray,
+    Xte: np.ndarray | None,
+    hr_te: np.ndarray | None,
+    yte: np.ndarray | None,
     rec_key_te: np.ndarray | None,
     cfg_train: argparse.Namespace,
     ppg_mode: str,
@@ -640,40 +667,62 @@ def train_validate_test(
         model.load_state_dict(best["state"], strict=True)
     model.eval()
 
+    # Always compute final validation metrics on best checkpoint
     with torch.no_grad():
-        xb = torch.tensor(Xte, dtype=torch.float32, device=device)
+        xb = torch.tensor(Xva, dtype=torch.float32, device=device)
         if ppg_only:
-            pred = model(xb).cpu().numpy()
+            pv = model(xb).cpu().numpy()
         else:
-            hb = torch.tensor(hr_te, dtype=torch.float32, device=device)
-            pred = model(xb, hb).cpu().numpy()
+            hb = torch.tensor(hr_va, dtype=torch.float32, device=device)
+            pv = model(xb, hb).cpu().numpy()
 
-    mae = float(mean_absolute_error(yte, pred))
-    rmse = float(np.sqrt(mean_squared_error(yte, pred)))
-    r2 = float(r2_score(yte, pred))
+    val_mae = float(mean_absolute_error(yva, pv))
+    val_rmse = float(np.sqrt(mean_squared_error(yva, pv)))
+    val_r2 = float(r2_score(yva, pv))
 
     out: Dict[str, object] = {
-        "test_mae": mae,
-        "test_rmse": rmse,
-        "test_r2": r2,
+        "val_mae": val_mae,
+        "val_rmse": val_rmse,
+        "val_r2": val_r2,
         "best_val_mae": float(best["mae"]),
         "best_state_dict": best["state"],
     }
 
-    # record-level: average all window predictions within the same original record
-    if rec_key_te is not None:
-        uniq = np.unique(rec_key_te)
-        rec_pred: List[float] = []
-        rec_y: List[float] = []
-        for u in uniq:
-            m = rec_key_te == u
-            rec_pred.append(float(np.mean(pred[m])))
-            rec_y.append(float(yte[m][0]))
-        rec_pred_arr = np.asarray(rec_pred, dtype=float)
-        rec_y_arr = np.asarray(rec_y, dtype=float)
-        out["test_record_mae"] = float(mean_absolute_error(rec_y_arr, rec_pred_arr))
-        out["test_record_rmse"] = float(np.sqrt(mean_squared_error(rec_y_arr, rec_pred_arr)))
-        out["test_record_r2"] = float(r2_score(rec_y_arr, rec_pred_arr))
+    # Optionally compute test metrics if provided
+    if Xte is not None and yte is not None and hr_te is not None:
+        with torch.no_grad():
+            xb = torch.tensor(Xte, dtype=torch.float32, device=device)
+            if ppg_only:
+                pred = model(xb).cpu().numpy()
+            else:
+                hb = torch.tensor(hr_te, dtype=torch.float32, device=device)
+                pred = model(xb, hb).cpu().numpy()
+
+        test_mae = float(mean_absolute_error(yte, pred))
+        test_rmse = float(np.sqrt(mean_squared_error(yte, pred)))
+        test_r2 = float(r2_score(yte, pred))
+        out.update(
+            {
+                "test_mae": test_mae,
+                "test_rmse": test_rmse,
+                "test_r2": test_r2,
+            }
+        )
+
+        # record-level: average all window predictions within the same original record
+        if rec_key_te is not None:
+            uniq = np.unique(rec_key_te)
+            rec_pred: List[float] = []
+            rec_y: List[float] = []
+            for u in uniq:
+                m = rec_key_te == u
+                rec_pred.append(float(np.mean(pred[m])))
+                rec_y.append(float(yte[m][0]))
+            rec_pred_arr = np.asarray(rec_pred, dtype=float)
+            rec_y_arr = np.asarray(rec_y, dtype=float)
+            out["test_record_mae"] = float(mean_absolute_error(rec_y_arr, rec_pred_arr))
+            out["test_record_rmse"] = float(np.sqrt(mean_squared_error(rec_y_arr, rec_pred_arr)))
+            out["test_record_r2"] = float(r2_score(rec_y_arr, rec_pred_arr))
 
     return out  # type: ignore[return-value]
 
@@ -686,15 +735,24 @@ def main() -> None:
     p.add_argument("--ppg-mode", type=str, default="full", choices=["full", "finger", "wrist"])
 
     # window sec range
-    p.add_argument("--sec", type=float, nargs=2, required=True, metavar=("START", "END"), help="e.g. --sec 0 5 or --sec 25 30")
+    p.add_argument(
+        "--sec",
+        type=str,
+        nargs=2,
+        required=True,
+        metavar=("START", "END"),
+        help="Seconds window range, e.g. --sec 0 5 / --sec 25 30 / --sec 0 1m",
+    )
 
     # scopes
     p.add_argument("--train-scope", type=str, default="same", choices=["same", "all12"], help="same uses only the specified window; all12 uses all equal windows")
     p.add_argument("--test-scope", type=str, default="same", choices=["same", "all12"], help="default same; all12 evaluates all equal windows")
 
     # split ratios
-    p.add_argument("--test-ratio", type=float, default=0.2)
-    p.add_argument("--val-ratio", type=float, default=0.2)
+    # If --test-ratio is not provided, we do train/val only (no test split),
+    # matching the behavior of the original regression scripts.
+    p.add_argument("--test-ratio", type=float, default=None, help="If set, create a test split with this ratio")
+    p.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio")
 
     # training hparams
     p.add_argument("--seed", type=int, default=42)
@@ -715,7 +773,16 @@ def main() -> None:
     derived_dir = Path(args.derived_dir).resolve()
     cfg = WindowConfig()
 
-    sec_start, sec_end = float(args.sec[0]), float(args.sec[1])
+    def _parse_sec(x: str) -> float:
+        s = str(x).strip().lower()
+        if s.endswith("m"):
+            # minutes, e.g. "1m" -> 60s
+            return float(s[:-1]) * 60.0
+        if s.endswith("s"):
+            return float(s[:-1])
+        return float(s)
+
+    sec_start, sec_end = _parse_sec(args.sec[0]), _parse_sec(args.sec[1])
     win_train_starts = _make_window_starts(sec_start, sec_end, scope=args.train_scope)
     win_test_starts = _make_window_starts(sec_start, sec_end, scope=args.test_scope)
 
@@ -726,41 +793,62 @@ def main() -> None:
         X60, sbp_raw, hr_raw, state, group, rec_index, task=args.task
     )
 
-    rec_tr, rec_va, rec_te = split_records_by_index(
-        rec_index_kept, test_ratio=args.test_ratio, val_ratio=args.val_ratio, seed=args.seed
-    )
+    uniq_rec = np.unique(rec_index_kept)
+    if args.test_ratio is None:
+        # train/val split only (mimic train_march_sbp_torch.py: window-level split)
+        # Build all windows using train_scope, then randomly split windows into train/val.
+        Xpool, hr_pool, y_pool, _ = build_windows_from_loaded(
+            X60, y_all, hr_z_all, rec_index_kept,
+            records_in_split=uniq_rec,
+            sec_start=sec_start, sec_end=sec_end,
+            scope_starts=win_train_starts,
+            cfg=cfg_window,
+        )
+        idx = np.arange(len(y_pool))
+        tr_idx, va_idx = train_test_split(
+            idx, test_size=args.val_ratio, random_state=args.seed, shuffle=True
+        )
+        Xtr, hr_tr, ytr = Xpool[tr_idx], hr_pool[tr_idx], y_pool[tr_idx]
+        Xva, hr_va, yva = Xpool[va_idx], hr_pool[va_idx], y_pool[va_idx]
+        Xte = hr_te = yte = rec_key_te = None
+    else:
+        rec_tr, rec_va, rec_te = split_records_by_index(
+            rec_index_kept, test_ratio=args.test_ratio, val_ratio=args.val_ratio, seed=args.seed
+        )
 
     # Build windowed arrays per split & scope (ensures consistent split by record index).
     print(f"Window L={sec_end-sec_start:.3f}s; train_scope={args.train_scope} test_scope={args.test_scope}")
     print(f"#train_windows={len(win_train_starts)} #test_windows={len(win_test_starts)}")
 
     # Train/Val/Test arrays
-    Xtr, hr_tr, ytr, _ = build_windows_from_loaded(
-        X60, y_all, hr_z_all, rec_index_kept,
-        records_in_split=rec_tr,
-        sec_start=sec_start, sec_end=sec_end,
-        scope_starts=win_train_starts,
-        cfg=cfg_window,
-    )
-    Xva, hr_va, yva, _ = build_windows_from_loaded(
-        X60, y_all, hr_z_all, rec_index_kept,
-        records_in_split=rec_va,
-        sec_start=sec_start, sec_end=sec_end,
-        scope_starts=win_train_starts,
-        cfg=cfg_window,
-    )
-    Xte, hr_te, yte, rec_key_te = build_windows_from_loaded(
-        X60, y_all, hr_z_all, rec_index_kept,
-        records_in_split=rec_te,
-        sec_start=sec_start, sec_end=sec_end,
-        scope_starts=win_test_starts,
-        cfg=cfg_window,
-    )
+    if args.test_ratio is not None:
+        Xtr, hr_tr, ytr, _ = build_windows_from_loaded(
+            X60, y_all, hr_z_all, rec_index_kept,
+            records_in_split=rec_tr,
+            sec_start=sec_start, sec_end=sec_end,
+            scope_starts=win_train_starts,
+            cfg=cfg_window,
+        )
+        Xva, hr_va, yva, _ = build_windows_from_loaded(
+            X60, y_all, hr_z_all, rec_index_kept,
+            records_in_split=rec_va,
+            sec_start=sec_start, sec_end=sec_end,
+            scope_starts=win_train_starts,
+            cfg=cfg_window,
+        )
+        Xte, hr_te, yte, rec_key_te = build_windows_from_loaded(
+            X60, y_all, hr_z_all, rec_index_kept,
+            records_in_split=rec_te,
+            sec_start=sec_start, sec_end=sec_end,
+            scope_starts=win_test_starts,
+            cfg=cfg_window,
+        )
 
     if args.shuffle_labels:
         ytr = shuffle_labels(ytr, seed=args.seed)
 
-    print(f"Dataset shapes: Xtr {Xtr.shape} Xva {Xva.shape} Xte {Xte.shape}")
+    xte_shape = None if Xte is None else Xte.shape
+    print(f"Dataset shapes: Xtr {Xtr.shape} Xva {Xva.shape} Xte {xte_shape}")
 
     cfg_train = argparse.Namespace(
         epochs=args.epochs,
@@ -790,7 +878,9 @@ def main() -> None:
     )
 
     print("-" * 60)
-    print(f"TEST segment-level: MAE={out['test_mae']:.3f} RMSE={out['test_rmse']:.3f} R2={out['test_r2']:.3f}")
+    print(f"VAL: MAE={out['val_mae']:.3f} RMSE={out['val_rmse']:.3f} R2={out['val_r2']:.3f}")
+    if "test_mae" in out:
+        print(f"TEST segment-level: MAE={out['test_mae']:.3f} RMSE={out['test_rmse']:.3f} R2={out['test_r2']:.3f}")
     if "test_record_mae" in out:
         print(
             f"TEST record-level (mean of windows per record): "
