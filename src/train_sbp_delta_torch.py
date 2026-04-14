@@ -54,6 +54,20 @@ def _is_rest(s: str) -> bool:
     return str(s).strip().lower() in REST_STATES
 
 
+def window_slice_zscore(X: np.ndarray, n_samples: int, eps: float = 1e-6) -> np.ndarray:
+    """
+    X: (N, T, C)，取每条样本前 n_samples 个时间点，沿时间逐通道 z-score（与短时窗推理一致）。
+    """
+    if n_samples < 1:
+        raise ValueError("n_samples must be >= 1")
+    if X.shape[1] < n_samples:
+        raise ValueError(f"T={X.shape[1]} < window n_samples={n_samples}")
+    w = np.ascontiguousarray(X[:, :n_samples, :]).astype(np.float32)
+    mean = np.mean(w, axis=1, keepdims=True)
+    std = np.maximum(np.std(w, axis=1, keepdims=True), eps)
+    return ((w - mean) / std).astype(np.float32)
+
+
 def compute_delta_sbp(
     y: np.ndarray, group: np.ndarray, state: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -85,6 +99,9 @@ def _augment(xb: torch.Tensor, noise_std: float = 0.05, max_shift: int = 30) -> 
         xb = xb + torch.randn_like(xb, device=xb.device) * noise_std
     if max_shift > 0:
         B, T, C = xb.shape
+        max_shift = min(max_shift, max(T - 1, 0))
+        if max_shift <= 0:
+            return xb
         shifts = torch.randint(-max_shift, max_shift + 1, (B,), device=xb.device)
         out = xb.clone()
         for i in range(B):
@@ -108,7 +125,8 @@ def train_all(
     y: np.ndarray,
     cfg: "DeltaTrainConfig",
     device: torch.device,
-    val_ratio: float,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
     ppg_mode: str = PPG_MODE_FULL,
 ) -> Dict:
     from torch import nn
@@ -124,10 +142,6 @@ def train_all(
     loss_fn = nn.HuberLoss(delta=cfg.huber_delta)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(cfg.epochs, 1))
 
-    idx = np.arange(len(y))
-    tr_idx, va_idx = train_test_split(
-        idx, test_size=val_ratio, random_state=cfg.seed, shuffle=True, stratify=None
-    )
     Xtr, Htr, Ytr = X[tr_idx], hr[tr_idx], y[tr_idx]
     Xva, Hva, Yva = X[va_idx], hr[va_idx], y[va_idx]
 
@@ -193,6 +207,18 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Train SBP model predicting ΔSBP (PPG + HR)")
     p.add_argument("--data", type=str, default="data/eval/ppg2026_dataset.npz",
                    help="NPZ path(s), comma-separated. Must have group, state.")
+    p.add_argument(
+        "--window-sec",
+        type=float,
+        default=60.0,
+        help="PPG 时间窗（秒）@10Hz，从每条样本开头截取；默认 60 与 NPZ 一致。",
+    )
+    p.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.0,
+        help="独立测试集比例（>0 时先划出 test，再在剩余上按 --val-ratio 分 train/val）。",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--val-ratio", type=float, default=0.2)
@@ -250,13 +276,51 @@ def main() -> None:
     n_drop = (~keep).sum()
     if n_drop > 0:
         X, hr = X[keep], hr[keep]
+        group = group[keep]
+        state = state[keep]
         print(f"ΔSBP: dropped {n_drop} samples (no rest baseline)")
     print(f"ΔSBP range: [{y.min():.1f}, {y.max():.1f}], mean={y.mean():.1f}, std={y.std():.1f}")
+
+    n_win = int(round(float(args.window_sec) * 10.0))
+    if n_win < 1 or n_win > X.shape[1]:
+        raise ValueError(
+            f"--window-sec={args.window_sec} => {n_win} samples, need 1..{X.shape[1]}"
+        )
+    X = window_slice_zscore(X, n_win)
+    print(f"PPG window: {args.window_sec:g}s -> X {X.shape} (slice + z-score)")
 
     if args.shuffle_labels:
         y = shuffle_labels(y, args.seed)
 
-    out = train_all(X, hr, y, cfg, device, float(args.val_ratio), args.ppg_mode)
+    idx_all = np.arange(len(y), dtype=np.int64)
+    if args.test_ratio > 0:
+        pool_idx, test_idx = train_test_split(
+            idx_all,
+            test_size=float(args.test_ratio),
+            random_state=args.seed,
+            shuffle=True,
+        )
+        tr_idx, va_idx = train_test_split(
+            pool_idx,
+            test_size=float(args.val_ratio),
+            random_state=args.seed,
+            shuffle=True,
+        )
+        print(
+            f"Split: train {len(tr_idx)}, val {len(va_idx)}, test {len(test_idx)} "
+            f"(test_ratio={args.test_ratio}, val_ratio={args.val_ratio})"
+        )
+    else:
+        test_idx = np.array([], dtype=np.int64)
+        tr_idx, va_idx = train_test_split(
+            idx_all,
+            test_size=float(args.val_ratio),
+            random_state=args.seed,
+            shuffle=True,
+        )
+        print(f"Split: train {len(tr_idx)}, val {len(va_idx)} (test_ratio=0)")
+
+    out = train_all(X, hr, y, cfg, device, tr_idx, va_idx, args.ppg_mode)
     print("-" * 60)
     print(f"VAL: MAE={out['val_mae']:.3f} ΔmmHg, RMSE={out['val_rmse']:.3f}, R2={out['val_r2']:.3f}")
 
@@ -264,13 +328,15 @@ def main() -> None:
         sd = Path(args.save_dir)
         sd.mkdir(parents=True, exist_ok=True)
         torch.save(out["best_state_dict"], sd / "best_state_dict.pt")
-        np.savez_compressed(
-            sd / "metrics.npz",
+        save_kw = dict(
             val_mae=np.array([out["val_mae"]], float),
             val_rmse=np.array([out["val_rmse"]], float),
             val_r2=np.array([out["val_r2"]], float),
             seed=np.array([args.seed], int),
             val_ratio=np.array([args.val_ratio], float),
+            test_ratio=np.array([args.test_ratio], float),
+            window_sec=np.array([float(args.window_sec)], float),
+            window_samples=np.array([n_win], int),
             ppg_mode=np.array([args.ppg_mode], dtype=object),
             data_paths=np.array(paths, dtype=object),
             target=np.array(["delta"], dtype=object),
@@ -278,7 +344,9 @@ def main() -> None:
             n_layers=np.array([cfg.n_layers], int),
             n_heads=np.array([cfg.n_heads], int),
             dropout=np.array([cfg.dropout], float),
+            test_indices=test_idx,
         )
+        np.savez_compressed(sd / "metrics.npz", **save_kw)
         print(f"Wrote {sd/'best_state_dict.pt'} and {sd/'metrics.npz'}")
         if args.plot and plt:
             fig, ax = plt.subplots(1, 1, figsize=(7.2, 4.2))
